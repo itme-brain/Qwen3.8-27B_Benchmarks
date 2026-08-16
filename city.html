@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ASCII CITY</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #050607;
+    overflow: hidden;
+    user-select: none;
+  }
+  #wrap {
+    height: 100%;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 6px;
+  }
+  pre#scene {
+    margin: 0;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    line-height: 1.04;
+    white-space: pre;
+    cursor: crosshair;
+  }
+  #hud {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    text-align: center;
+    color: #8b96a8;
+    opacity: 0.85;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <pre id="scene"></pre>
+  <div id="hud"></div>
+</div>
+<script>
+"use strict";
+/* ============================================================
+   ASCII CITY — a tiny first-person city engine in pure ASCII
+   ----------------------------------------------------------
+   Architecture:
+     world.js-style sections:  grid world (procedural)
+     engine:                    fixed-timestep update + render
+     renderer:                  DDA raycast into a character grid:
+                                each column records the buildings
+                                its horizontal ray enters; each
+                                screen row is a true 3D ray (full
+                                +/-90 deg pitch, jump elevation)
+                                that resolves facade / spire /
+                                ground / sky per row, with a
+                                procedural sky
+     entities:                  cars (lane following + car
+                                following), NPCs (wander)
+     day/night:                 120s cycle, brightness ramps over
+                                ASCII glyphs, lit windows, stars,
+                                sun/moon, CSS tint
+   No canvas, no WebGL, no images, no fonts, no network.
+   ============================================================ */
+
+/* ---------------- constants ---------------- */
+const GW = 96;                 // world grid size (cells = units)
+const PER = 16;                // road period: 4-wide road + 12 block
+const ROAD_W = 4;
+const SW = 152, SH = 78;       // screen character resolution
+const HORIZON = SH >> 1;       // 39
+const EYE = 1.6;               // eye height
+const FOV = 70 * Math.PI / 180;
+const TANF = Math.tan(FOV / 2);
+const SCALE = (SW / 2) / TANF; // chars per unit at 1 unit away
+const MAXD = 70;               // draw / fog distance
+const DAY_LEN = 120;           // seconds per full day
+const TWO_PI = Math.PI * 2;
+
+// cell ground types
+const T_ROAD = 0, T_SIDE = 1, T_APRON = 2, T_PARK = 3, T_PLAZA = 4;
+
+/* ---------------- small utils ---------------- */
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hash2(x, y, s) {
+  let n = Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(s | 0, 1442695041);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;
+}
+function normAng(a) {
+  a = a % TWO_PI;
+  if (a > Math.PI) a -= TWO_PI;
+  if (a < -Math.PI) a += TWO_PI;
+  return a;
+}
+function rampPick(ramp, level) { // level 0..8
+  const i = clamp(Math.round(level * (ramp.length - 1) / 8), 0, ramp.length - 1);
+  return ramp[i];
+}
+
+/* ---------------- world generation ---------------- */
+const gType = new Uint8Array(GW * GW);      // ground type per cell
+const gBld  = new Int32Array(GW * GW);      // building id per cell, -1 = none
+const bldgs = [];                           // {x0,z0,x1,z1,h,seed,spire}
+
+function addBox(x0, z0, w, d, h) {
+  const id = bldgs.length;
+  const b = {
+    x0, z0, x1: x0 + w - 1, z1: z0 + d - 1, h,
+    seed: ((id + 1) * 2654435761) >>> 0,
+    spire: 0
+  };
+  bldgs.push(b);
+  for (let x = x0; x < x0 + w; x++)
+    for (let z = z0; z < z0 + d; z++)
+      gBld[x + z * GW] = id;
+  return b;
+}
+
+function genWorld() {
+  gBld.fill(-1);
+  for (let bz = 0; bz < GW / PER; bz++) {
+    for (let bx = 0; bx < GW / PER; bx++) {
+      const x0 = bx * PER + ROAD_W, z0 = bz * PER + ROAD_W; // 12x12 block
+      const rng = mulberry32((bx * 73856093) ^ (bz * 19349663) ^ 42);
+      const central = (bx === 2 && bz === 2) || (bx === 3 && bz === 3);
+      // ground: sidewalk ring, interior apron (or plaza)
+      for (let x = x0; x < x0 + 12; x++) for (let z = z0; z < z0 + 12; z++) {
+        const ring = x === x0 || x === x0 + 11 || z === z0 || z === z0 + 11;
+        gType[x + z * GW] = ring ? T_SIDE : (central ? T_PLAZA : T_APRON);
+      }
+      if (central) continue; // plaza (fountains added below)
+      if (rng() < 0.22) { // park
+        for (let x = x0 + 1; x < x0 + 11; x++)
+          for (let z = z0 + 1; z < z0 + 11; z++)
+            gType[x + z * GW] = T_PARK;
+        continue;
+      }
+      // buildings in the 10x10 interior (offset +1)
+      const r = rng();
+      const fx = x0 + 1, fz = z0 + 1;
+      const cdist = Math.hypot(x0 + 5 - GW / 2, z0 + 5 - GW / 2) / 68;
+      const hf = 1.8 - cdist * 1.35;
+      const hgt = () => clamp(Math.round((5 + rng() * 9) * hf), 4, 34);
+      let fps;
+      if (r < 0.38) fps = [[0, 0, 10, 10]];
+      else if (r < 0.68) fps = rng() < 0.5 ? [[0, 0, 10, 4], [0, 6, 10, 4]] : [[0, 0, 4, 10], [6, 0, 4, 10]];
+      else fps = [[0, 0, 4, 4], [6, 0, 4, 4], [0, 6, 4, 4], [6, 6, 4, 4]];
+      for (const [ox, oz, w, d] of fps) {
+        const b = addBox(fx + ox, fz + oz, w, d, hgt());
+        if (b.h >= 18 && rng() < 0.55) b.spire = b.h > 26 ? 4 : 3;
+      }
+    }
+  }
+  // fountains on the plaza
+  addBox(40, 40, 3, 3, 3);
+  addBox(57, 57, 3, 3, 3);
+  // a landmark tower near the center
+  let best = -1, bd = 1e9;
+  for (const b of bldgs) {
+    const d = Math.hypot((b.x0 + b.x1) / 2 - GW / 2, (b.z0 + b.z1) / 2 - GW / 2);
+    if (d < bd) { bd = d; best = bldgs.indexOf(b); }
+  }
+  if (best >= 0) { bldgs[best].h = 34; bldgs[best].spire = 4; }
+}
+
+/* ---------------- player ---------------- */
+const player = { x: 36.4, z: 41.5, a: -Math.PI / 2, y: 0, vy: 0, speed: 0, bob: 0 }; // plaza edge, facing the skyline
+const RADIUS = 0.45;
+let pitch = 0;                   // camera pitch, rad (+ = up)
+const PITCH_MAX = Math.PI / 2;   // full straight-up / straight-down
+
+function pointBlocked(x, z) {
+  if (x < 0.5 || z < 0.5 || x > GW - 0.5 || z > GW - 0.5) return true;
+  const x0 = Math.floor(x - RADIUS), x1 = Math.floor(x + RADIUS);
+  const z0 = Math.floor(z - RADIUS), z1 = Math.floor(z + RADIUS);
+  for (let cx = x0; cx <= x1; cx++) for (let cz = z0; cz <= z1; cz++) {
+    if (cx < 0 || cz < 0 || cx >= GW || cz >= GW) return true;
+    const id = gBld[cx + cz * GW];
+    if (id < 0) continue;
+    const b = bldgs[id];
+    const nx = clamp(x, b.x0, b.x1 + 1), nz = clamp(z, b.z0, b.z1 + 1);
+    if ((x - nx) * (x - nx) + (z - nz) * (z - nz) < RADIUS * RADIUS) return true;
+  }
+  return false;
+}
+
+function movePlayer(dt) {
+  const k = keys;
+  let mx = 0, mz = 0;
+  if (k.has("KeyW") || k.has("ArrowUp"))    mz += 1;
+  if (k.has("KeyS") || k.has("ArrowDown"))  mz -= 1;
+  if (k.has("KeyA")) mx -= 1;
+  if (k.has("KeyD")) mx += 1;
+  if (k.has("ArrowLeft"))  player.a -= 1.9 * dt;
+  if (k.has("ArrowRight")) player.a += 1.9 * dt;
+  if (k.has("KeyR")) pitch = Math.min(PITCH_MAX, pitch + 1.6 * dt);
+  if (k.has("KeyF")) pitch = Math.max(-PITCH_MAX, pitch - 1.6 * dt);
+  // jump physics (flat city: ground is always y = 0)
+  if (player.y > 0 || player.vy > 0) {
+    player.vy -= 12 * dt;
+    player.y += player.vy * dt;
+    if (player.y <= 0) { player.y = 0; player.vy = 0; }
+  }
+  const len = Math.hypot(mx, mz);
+  const run = k.has("ShiftLeft") || k.has("ShiftRight");
+  const spd = len > 0 ? (run ? 5.2 : 2.9) : 0;
+  if (len > 0) { mx /= len; mz /= len; if (player.y === 0) player.bob += spd * dt * 2.1; }
+  const f = [Math.cos(player.a), Math.sin(player.a)];
+  const r = [-f[1], f[0]];
+  const vx = (f[0] * mz + r[0] * mx) * spd;
+  const vz = (f[1] * mz + r[1] * mx) * spd;
+  const nx = player.x + vx * dt, nz = player.z + vz * dt;
+  if (!pointBlocked(nx, nz)) { player.x = nx; player.z = nz; }
+  else if (!pointBlocked(nx, player.z)) player.x = nx;
+  else if (!pointBlocked(player.x, nz)) player.z = nz;
+}
+
+/* ---------------- cars ---------------- */
+const cars = [];
+function laneFor(axis, dir, band) { // right-hand traffic
+  const c = band * PER + 1.5;
+  if (axis === "x") return c + (dir === 1 ? 0.75 : -0.75);
+  return c + (dir === 1 ? -0.75 : 0.75);
+}
+function spawnCars(n) {
+  for (let i = 0; i < n; i++) {
+    const axis = Math.random() < 0.5 ? "x" : "z";
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    const band = (Math.random() * (GW / PER)) | 0;
+    const car = {
+      axis, dir, lane: laneFor(axis, dir, band),
+      pos: band * PER + ROAD_W + Math.random() * (PER - ROAD_W - 2),
+      base: 2.2 + Math.random() * 1.5, speed: 2, lastX: -1
+    };
+    cars.push(car);
+  }
+}
+function carPos(c) { return c.axis === "x" ? [c.pos, c.lane] : [c.lane, c.pos]; }
+
+function updateCar(c, dt) {
+  // car following
+  let target = c.base;
+  for (const o of cars) {
+    if (o === c || o.axis !== c.axis || o.dir !== c.dir) continue;
+    if (Math.abs(o.lane - c.lane) >= 0.6) continue;
+    const gap = (o.pos - c.pos) * c.dir;
+    if (gap > 0.1 && gap < 3.5) target = Math.min(target, Math.max(0, (gap - 2.4) * 1.6));
+  }
+  c.speed += (target - c.speed) * Math.min(1, dt * 3.2);
+  let np = c.pos + c.speed * c.dir * dt;
+  // world bounds: turn around (before any turn below re-axes the car)
+  if (np < 1 || np > GW - 1) { c.dir = -c.dir; np = c.pos + c.speed * c.dir * dt; }
+  np = clamp(np, 1, GW - 1);
+  // intersection logic
+  const m = ((np % PER) + PER) % PER;
+  const k = Math.floor(np / PER);
+  let turned = false;
+  if (m < ROAD_W && c.lastX !== k) {
+    const r = Math.random();
+    const turn = r < 0.15 ? 1 : r < 0.28 ? -1 : 0; // 1 = right, -1 = left
+    if (turn !== 0) {
+      if (c.axis === "x") { // was along x -> now along z, crossed vertical road k
+        const newDir = turn === 1 ? c.dir : -c.dir;
+        const j = Math.floor(c.lane / PER);
+        c.axis = "z"; c.dir = newDir;
+        c.lane = k * PER + 1.5 + (newDir === 1 ? -0.75 : 0.75);
+        c.pos = j * PER + 1.5;
+      } else { // was along z -> now along x, crossed horizontal road k
+        const newDir = turn === 1 ? -c.dir : c.dir;
+        const j = Math.floor(c.lane / PER);
+        c.axis = "x"; c.dir = newDir;
+        c.lane = k * PER + 1.5 + (newDir === 1 ? 0.75 : -0.75);
+        c.pos = j * PER + 1.5;
+      }
+      c.lastX = k; turned = true;
+    } else c.lastX = k;
+  } else if (m >= ROAD_W) c.lastX = -1;
+  if (!turned) c.pos = np;
+}
+
+/* ---------------- NPCs ---------------- */
+const npcs = [];
+function cellWalkable(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  if (ix < 0 || iz < 0 || ix >= GW || iz >= GW) return false;
+  if (gBld[ix + iz * GW] >= 0) return false;
+  const t = gType[ix + iz * GW];
+  return t !== T_ROAD; // they stay off the asphalt
+}
+function spawnNpcs(n) {
+  for (let i = 0; i < n; i++) {
+    for (let tries = 0; tries < 200; tries++) {
+      const x = 2 + Math.random() * (GW - 4), z = 2 + Math.random() * (GW - 4);
+      if (!cellWalkable(x, z)) continue;
+      if (Math.hypot(x - player.x, z - player.z) < 4) continue;
+      npcs.push({ x, z, h: Math.random() * TWO_PI, spd: 0.9 + Math.random() * 0.5, timer: 0, phase: 0 });
+      break;
+    }
+  }
+}
+function updateNpc(n, dt) {
+  n.timer -= dt;
+  if (n.timer <= 0) {
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]].filter(
+      d => cellWalkable(n.x + d[0] * 1.5, n.z + d[1] * 1.5));
+    if (dirs.length) {
+      const d = dirs[(Math.random() * dirs.length) | 0];
+      n.h = Math.atan2(d[1], d[0]);
+    }
+    n.timer = 1.5 + Math.random() * 3.5;
+  }
+  const nx = n.x + Math.cos(n.h) * n.spd * dt;
+  const nz = n.z + Math.sin(n.h) * n.spd * dt;
+  if (cellWalkable(nx, nz) && !pointBlocked(nx, nz)) {
+    n.x = nx; n.z = nz; n.phase += n.spd * dt * 3;
+  } else n.timer = 0;
+}
+
+/* ---------------- day/night ---------------- */
+let timeT = 0.18;   // 0..1 fraction of day; t=0 -> 06:00
+let sun = 0, daylight = 1, dusk = 0, fogK = 0.015, winBucket = 0;
+
+function updateSky(dt) {
+  timeT = (timeT + dt / DAY_LEN) % 1;
+  if (timeT < 0) timeT += 1;
+  sun = Math.sin(TWO_PI * timeT);
+  daylight = clamp01((sun + 0.10) * 2.4);
+  dusk = clamp01(1 - Math.abs(sun) * 3.0);
+  fogK = 0.014 + 0.05 * Math.pow(1 - daylight, 1.5);
+  winBucket = Math.floor(timeT * 24 * 3);
+  // dynamic terminal tint: night blue -> dusk amber -> day pale
+  const night = [126, 146, 196], dsk = [240, 176, 96], day = [226, 235, 214];
+  let c;
+  if (daylight > 0.45) {
+    const f = (daylight - 0.45) / 0.55;
+    c = dsk.map((v, i) => v + (day[i] - v) * f);
+  } else {
+    const f = daylight / 0.45;
+    c = night.map((v, i) => v + (dsk[i] - v) * f);
+  }
+  scene.style.color = `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`;
+  scene.style.textShadow = `0 0 6px rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},0.55)`;
+}
+
+/* ---------------- renderer ---------------- */
+const scene = document.getElementById("scene");
+const hud = document.getElementById("hud");
+
+const buf = new Array(SW * SH);          // character frame buffer
+const VHALF = Math.atan(HORIZON / SCALE);        // vertical half-FOV (matches the legacy scale)
+const ANGLIM = Math.PI / 2 - 0.0175;             // clamp ray elevations just short of the poles
+const MAXBOX = 10;                               // max building entries recorded per column
+const cBoxN = new Int32Array(SW);                // building entries per column
+const cBoxT = new Float64Array(SW * MAXBOX);     // entry distance
+const cBoxB = new Int32Array(SW * MAXBOX);       // building id
+const cBoxS = new Int8Array(SW * MAXBOX);        // entry side (0 = x face, 1 = z face)
+const cBoxSp = new Float64Array(SW * MAXBOX);    // distance to the spire needle
+const cBoxSpO = new Float64Array(SW * MAXBOX);   // lateral offset from the spire needle
+
+const WALL_RAMP = " .:-=+*#";
+
+function groundCh(ix, iz, wx, wz, level) {
+  if (ix < 0 || iz < 0 || ix >= GW || iz >= GW) return rampPick(" .:',", level);
+  const t = gType[ix + iz * GW];
+  if (t === T_ROAD) {
+    let ch = rampPick(" .:'", level);
+    const lx = ix % PER, lz = iz % PER;
+    if (lx < ROAD_W && (lx === 1 || lx === 2) && lz >= ROAD_W && (Math.floor(wz) % 5) < 3)
+      ch = rampPick(" .:-=", level + 2);
+    else if (lz < ROAD_W && (lz === 1 || lz === 2) && lx >= ROAD_W && (Math.floor(wx) % 5) < 3)
+      ch = rampPick(" .:-=", level + 2);
+    return ch;
+  }
+  if (t === T_SIDE)  return rampPick(" .:-", level);
+  if (t === T_APRON) return rampPick(" .:,'", level);
+  if (t === T_PARK)  return hash2(ix, iz, 99) < 0.16 ? rampPick(" .oO", Math.min(8, level + 4)) : rampPick(" .,'", level);
+  return rampPick(" .:-+", level); // plaza
+}
+
+function render() {
+  const a = player.a, cosA = Math.cos(a), sinA = Math.sin(a);
+  const eye = EYE + player.y; // jump lifts the eye
+  const moving = (keys.has("KeyW") || keys.has("KeyA") || keys.has("KeyS") || keys.has("KeyD")) && player.y === 0;
+  const bob = moving ? (Math.sin(player.bob) > 0.55 ? 1 : Math.sin(player.bob) < -0.55 ? -1 : 0) : 0;
+  // row r's ray elevation: a constant angular fan around the pitch
+  // (identical to the legacy scale at pitch 0), clamped at the poles
+  const hi = clamp(pitch + VHALF + bob * VHALF / HORIZON, -ANGLIM, ANGLIM);
+  const lo = clamp(pitch - VHALF - bob * VHALF / HORIZON, -ANGLIM, ANGLIM);
+  const dA = (hi - lo) / (SH - 1);      // elevation step per row
+  const hzr = hi / dA;                  // horizon row (may be off-screen)
+
+  // sun / moon screen positions (for sky overlay)
+  const sunAz = TWO_PI * timeT;
+  let sunOn = null;
+  {
+    const elev = sun > 0.03 ? sun : (-sun > 0.03 ? -sun : 0);
+    if (elev > 0) {
+      const isMoon = sun < 0;
+      const az = isMoon ? sunAz + Math.PI : sunAz;
+      const diff = normAng(az - a);
+      if (Math.abs(diff) < 1.25) {
+        const rSun = (hi - elev) / dA;
+        if (rSun > -2 && rSun < SH + 2)
+          sunOn = { c: Math.floor(SW / 2 + Math.tan(diff) * SCALE), r: Math.floor(rSun), moon: isMoon };
+      }
+    }
+  }
+  const twk = winBucket % 3;
+  const pRow = Math.round(pitch / dA), pCol = Math.round(a / dA); // sky-dome scroll
+  // hot-loop locals (avoid repeated global lookups)
+  const bd = bldgs, gT = gType, cT = cBoxT, cB = cBoxB, cS = cBoxS, cSp = cBoxSp, cSpO = cBoxSpO, cN = cBoxN;
+  const px = player.x, pz = player.z, gB = gBld;
+
+  for (let i = 0; i < buf.length; i++) buf[i] = " ";
+
+  /* --- per-column DDA sequence, then per-row rays --- */
+  for (let c = 0; c < SW; c++) {
+    const u = (2 * c + 1) / SW - 1; // -1 .. 1 across the screen
+    const rdx = cosA - u * sinA * TANF;
+    const rdz = sinA + u * cosA * TANF;
+
+    // DDA — record every building the column's horizontal ray enters, in
+    // order. Each screen row is its own 3D ray (same horizontal path, its
+    // own slope) and decides which of these boxes it actually hits.
+    let mapX = Math.floor(px), mapZ = Math.floor(pz);
+    const dtx = Math.abs(rdx) < 1e-9 ? 1e9 : Math.abs(1 / rdx);
+    const dtz = Math.abs(rdz) < 1e-9 ? 1e9 : Math.abs(1 / rdz);
+    const stx = rdx > 0 ? 1 : -1, stz = rdz > 0 ? 1 : -1;
+    let sdx = (rdx > 0 ? (mapX + 1 - px) : (px - mapX)) * dtx;
+    let sdz = (rdz > 0 ? (mapZ + 1 - pz) : (pz - mapZ)) * dtz;
+    const base = c * MAXBOX;
+    let n = 0, lastId = -1;
+    const rdl = rdx * rdx + rdz * rdz;
+    for (let i = 0; i < 160; i++) {
+      const t = sdx < sdz ? sdx : sdz;
+      if (t > MAXD) break;
+      let side;
+      if (sdx < sdz) { sdx += dtx; mapX += stx; side = 0; }
+      else           { sdz += dtz; mapZ += stz; side = 1; }
+      if (mapX < 0 || mapZ < 0 || mapX >= GW || mapZ >= GW) break;
+      const id = gB[mapX + mapZ * GW];
+      if (id >= 0 && id !== lastId && n < MAXBOX) {
+        const b = bd[id];
+        cT[base + n] = t;
+        cB[base + n] = id;
+        cS[base + n] = side;
+        // ray projection onto this building's spire needle (box center)
+        const cxm = (b.x0 + b.x1 + 1) / 2, czm = (b.z0 + b.z1 + 1) / 2;
+        const tSp = ((cxm - px) * rdx + (czm - pz) * rdz) / rdl;
+        cSp[base + n] = tSp;
+        cSpO[base + n] = Math.hypot(px + rdx * tSp - cxm, pz + rdz * tSp - czm);
+        n++;
+        lastId = id;
+      }
+    }
+    cN[c] = n;
+
+    /* --- per-row rays --- */
+    for (let r = 0; r < SH; r++) {
+      const m = Math.tan(hi - r * dA); // vertical slope of this row's ray
+      let ch = " ";
+      let hit = -1, hitT = 0, spireH = 0;
+      for (let i = 0; i < n; i++) {
+        const tIn = cT[base + i];
+        const yIn = eye + tIn * m;
+        if (yIn < 0) break; // ground plane reached first
+        const b = bd[cB[base + i]];
+        if (yIn <= b.h) { hit = i; hitT = tIn; break; }        // facade
+        if (b.spire && cSpO[base + i] < 0.6 && cSp[base + i] >= tIn) {
+          const ySp = eye + cSp[base + i] * m;
+          if (ySp <= b.h + b.spire) { hit = i; hitT = cSp[base + i]; spireH = ySp - b.h; break; }
+        }
+      }
+      if (hit >= 0) {
+        const b = bd[cB[base + hit]];
+        if (spireH > 0) {
+          ch = spireH < 1.2 ? "o" : spireH < 2.4 ? "/" : "|";
+        } else {
+          const side = cS[base + hit];
+          const wY = eye + hitT * m;
+          const wu = side === 0 ? pz + rdz * hitT : px + rdx * hitT;
+          const wx = wu - Math.floor(wu);
+          const wy = wY - Math.floor(wY);
+          if (wx > 0.28 && wx < 0.72 && wy > 0.30 && wy < 0.82) {
+            // window
+            const fog = Math.exp(-hitT * fogK);
+            if (daylight < 0.45) {
+              const lit = hash2(b.seed, Math.floor(wu * 2) + (side ? 0 : 512), Math.floor(wY) * 7 + winBucket) < 0.48;
+              ch = lit ? (fog > 0.25 ? "o" : ".") : (daylight < 0.15 ? " " : ":");
+            } else ch = daylight * 8 > 3 ? "." : ":";
+          } else {
+            const fog = Math.exp(-hitT * fogK);
+            const nx = side === 0 ? (rdx > 0 ? -1 : 1) : 0;
+            const nz = side === 1 ? (rdz > 0 ? -1 : 1) : 0;
+            const fl = 0.5 + 0.5 * Math.max(0, nx * Math.cos(sunAz) + nz * Math.sin(sunAz));
+            ch = WALL_RAMP[clamp(Math.floor(daylight * fl * fog * 8), 0, WALL_RAMP.length - 1)];
+          }
+        }
+      } else if (m < 0) {
+        const dg = -eye / m; // distance to the flat ground along this row
+        if (dg > 85) ch = Math.abs(hzr - r) < 1.5 && daylight > 0.15 ? ":" : " "; // haze at horizon
+        else {
+          const gx = px + rdx * dg, gz = pz + rdz * dg;
+          const gl = daylight * Math.exp(-dg * fogK) * 8;
+          ch = groundCh(Math.floor(gx), Math.floor(gz), gx, gz, gl);
+        }
+      } else {
+        const k = hzr - r;
+        if (k >= 0.5 && k < 1.5) ch = daylight > 0.12 ? ":" : ".";
+        else if (k >= 1.5 && k < 2.5) ch = (daylight > 0.3 || dusk > 0.3) && hash2(c + pCol, r + pRow, 7) < 0.45 ? ":" : " ";
+        else if (daylight < 0.15 && k > 6 && hash2(c + pCol, r + pRow, 17 + twk) < 0.08) ch = ".";
+        // sun / moon disc
+        if (sunOn) {
+          const dc = c - sunOn.c, dr = r - sunOn.r;
+          if (Math.abs(dc) <= 1 && Math.abs(dr) <= 1 && dc + dr <= 1 && dc >= dr) {
+            if (dr === 0 && dc === 0) ch = "O";
+            else if (!(sunOn.moon && daylight > 0.15)) ch = sunOn.moon ? "." : "o";
+          }
+        }
+      }
+      buf[r * SW + c] = ch;
+    }
+  }
+
+  /* --- entities (drawn over the raster, with occlusion) --- */
+  function wallDist(c2, r2) { // first facade blocking row r2 of column c2
+    const m = Math.tan(hi - r2 * dA);
+    const base2 = c2 * MAXBOX;
+    for (let i = 0; i < cN[c2]; i++) {
+      if (eye + cT[base2 + i] * m <= bd[cB[base2 + i]].h) return cT[base2 + i];
+    }
+    return Infinity;
+  }
+  function project(x, z) {
+    const dx = x - px, dz = z - pz;
+    const d = dx * cosA + dz * sinA;          // distance along view axis
+    if (d < 0.5) return null;
+    const cross = -dx * sinA + dz * cosA;
+    const col = Math.floor(SW / 2 + (cross / d) * SCALE);
+    if (col < 0 || col >= SW) return null;
+    const row = Math.round((hi - Math.atan(-eye / d)) / dA); // ground under the entity
+    if (row < 0 || row >= SH) return null;
+    return { col, row, d, dx, dz };
+  }
+  function put(col, row, s, mid) {
+    const m = mid ? ((s.length - 1) >> 1) : 0;
+    for (let i = 0; i < s.length; i++) {
+      const cc = col - m + i;
+      if (cc >= 0 && cc < SW) buf[row * SW + cc] = s[i];
+    }
+  }
+  for (const c of cars) {
+    const p = project(carPos(c)[0], carPos(c)[1]);
+    if (!p || p.d >= wallDist(p.col, p.row) - 0.4) continue;
+    const hx = c.axis === "x" ? c.dir : 0, hz2 = c.axis === "x" ? 0 : c.dir;
+    const tl = Math.hypot(-p.dx, -p.dz) || 1;
+    const dot = (hx * -p.dx + hz2 * -p.dz) / tl;
+    let s;
+    const facing = dot > 0.35, away = dot < -0.35;
+    if (!facing && !away) {
+      const n = clamp(Math.round(2.6 * SCALE / p.d), 2, 5);
+      let side = "-".repeat(n);
+      const m = ((n - 2) >> 1);
+      side = side.slice(0, m) + "[]" + side.slice(m + 2);
+      s = side;
+    } else {
+      s = facing && daylight < 0.2 ? "oo" : "[]"; // headlights at night
+    }
+    put(p.col, p.row, s, true);
+  }
+  for (const n of npcs) {
+    const p = project(n.x, n.z);
+    if (!p || p.d >= wallDist(p.col, p.row) - 0.3) continue;
+    put(p.col, p.row, Math.floor(n.phase) % 2 ? "^" : "@", false);
+  }
+
+  /* --- emit --- */
+  let out = "";
+  for (let r = 0; r < SH; r++) {
+    out += buf.slice(r * SW, r * SW + SW).join("") + "\n";
+  }
+  scene.textContent = out;
+}
+
+/* ---------------- HUD ---------------- */
+let fps = 60;
+function updateHud() {
+  const hours = (6 + timeT * 24) % 24;
+  const hh = Math.floor(hours), mm = Math.floor((hours - hh) * 60);
+  const bar = "=".repeat(hh) + " ".repeat(23 - hh);
+  const deg = ((player.a * 180 / Math.PI) % 360 + 360) % 360;
+  const comp = ["E", "SE", "S", "SW", "W", "NW", "N", "NE"][Math.round(deg / 45) % 8];
+  hud.textContent =
+    `DAY ${dayCount + 1}  ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}  [${bar}]  ` +
+    `  ${comp}  ${fps | 0}fps\n` +
+    (locked ? "" : "click to capture mouse  ") +
+    "WASD move · mouse / R·F look up-down · SHIFT run · SPACE jump";
+}
+let dayCount = 0;
+
+/* ---------------- input ---------------- */
+const keys = new Set();
+let locked = false;
+addEventListener("keydown", e => {
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (!e.repeat && player.y === 0 && player.vy === 0) player.vy = 4.4;
+    return;
+  }
+  if (e.code.startsWith("Arrow") || e.code === "ShiftLeft" || e.code === "ShiftRight") e.preventDefault();
+  keys.add(e.code);
+});
+addEventListener("keyup", e => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+
+scene.addEventListener("click", () => {
+  if (scene.requestPointerLock) scene.requestPointerLock();
+});
+document.addEventListener("pointerlockchange", () => {
+  locked = document.pointerLockElement === scene;
+});
+addEventListener("mousemove", e => {
+  if (!locked) return;
+  player.a += e.movementX * 0.0022;
+  pitch = clamp(pitch - e.movementY * 0.002, -PITCH_MAX, PITCH_MAX);
+});
+
+/* ---------------- fit & loop ---------------- */
+function fit() {
+  const fs = Math.max(3, Math.min(
+    Math.floor(innerWidth / (SW * 0.62)),
+    Math.floor(innerHeight / ((SH + 3) * 1.06))
+  ));
+  scene.style.fontSize = fs + "px";
+}
+addEventListener("resize", fit);
+
+genWorld();
+spawnCars(16);
+spawnNpcs(14);
+fit();
+
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt <= 0) dt = 0;
+  if (dt > 0.05) dt = 0.05;
+  if (dt > 0) fps += (1 / dt - fps) * 0.06;
+
+  const wasT = timeT;
+  movePlayer(dt);
+  for (const c of cars) updateCar(c, dt);
+  for (const n of npcs) updateNpc(n, dt);
+  updateSky(dt);
+  if (wasT > timeT) dayCount++;   // wrapped around midnight
+
+  render();
+  updateHud();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
